@@ -1,1 +1,151 @@
-asfasf
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Hand Detection Alarm</title>
+  <style>
+    body, html { margin:0; padding:0; background:#000; }
+    #container {
+      position: absolute;
+      top: 10px; left: 10px;
+      width: 320px; height: 240px;
+      overflow: hidden;
+      border: 2px solid #f00;
+    }
+    #webcam, #overlay {
+      position: absolute;
+      width: 320px; height: 240px;
+      top:0; left:0;
+      object-fit: cover;
+    }
+    #overlay { pointer-events:none; }
+    #unlockOverlay {
+      position: absolute; top:0; left:0;
+      width:100vw; height:100vh;
+      background: rgba(0,0,0,0.7);
+      color:#fff; display:flex;
+      align-items:center; justify-content:center;
+      font-size:1.2em; text-align:center;
+      z-index:10;
+    }
+    #unlockOverlay.hidden { display:none; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <video id="webcam" autoplay muted playsinline></video>
+    <canvas id="overlay" width="320" height="240"></canvas>
+  </div>
+  <div id="unlockOverlay">
+    Tap or click anywhere to enable sound<br>
+    (required by most browsers)
+  </div>
+
+  <!-- drawing utils -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+  <script type="module">
+    import { HandLandmarker, FilesetResolver }
+      from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+    let handLandmarker, audioCtx;
+    let lastBeep = 0, detectInterval = null;
+    const BEEP_INTERVAL_MS = 500, POLL_MS = 200;
+
+    async function startDetection() {
+      const video   = document.getElementById("webcam");
+      const overlay = document.getElementById("overlay");
+      const ctx     = overlay.getContext("2d");
+
+      // Ensure model is loaded
+      if (!handLandmarker) {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+        );
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO",
+          numHands: 2
+        });
+      }
+
+      // If interval already running, clear it
+      if (detectInterval) {
+        clearInterval(detectInterval);
+      }
+      // Polling loop
+      detectInterval = setInterval(() => detectFrame(video, ctx), POLL_MS);
+    }
+
+    function detectFrame(video, ctx) {
+      try {
+        const startTime = performance.now();
+        const results   = handLandmarker.detectForVideo(video, startTime);
+        ctx.drawImage(video, 0, 0, ctx.canvas.width, ctx.canvas.height);
+
+        if (results.landmarks?.length) {
+          for (const lm of results.landmarks) {
+            drawConnectors(ctx, lm, HAND_CONNECTIONS, { color:"#f00", lineWidth:2 });
+            drawLandmarks(ctx, lm, { color:"#0f0", lineWidth:1 });
+          }
+          const now = performance.now();
+          if (now - lastBeep > BEEP_INTERVAL_MS) {
+            playWarningBeep();
+            lastBeep = now;
+          }
+        }
+      } catch (e) {
+        console.error("detect error:", e);
+      }
+    }
+
+    function playWarningBeep() {
+      if (!audioCtx || audioCtx.state === "suspended") return;
+      const pulseCount = 3, pulseFreq = 1000, pulseDur = 0.2, interPulse = 0.1;
+      for (let i = 0; i < pulseCount; i++) {
+        const t0 = audioCtx.currentTime + i * (pulseDur + interPulse);
+        const osc  = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = "square";
+        osc.frequency.value = pulseFreq;
+        gain.gain.setValueAtTime(1.2, t0);
+        gain.gain.exponentialRampToValueAtTime(0.001, t0 + pulseDur);
+        osc.connect(gain).connect(audioCtx.destination);
+        osc.start(t0);
+        osc.stop(t0 + pulseDur);
+      }
+    }
+
+    async function init() {
+      // Prime AudioContext
+      document.body.addEventListener("pointerdown", () => {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+          audioCtx.resume()
+            .then(() => document.getElementById("unlockOverlay").classList.add("hidden"));
+        }
+      }, { once: true });
+
+      // Start webcam
+      const video = document.getElementById("webcam");
+      video.srcObject = await navigator.mediaDevices.getUserMedia({ video: true });
+      video.addEventListener("loadeddata", startDetection);
+
+      // On tab focus or visibility change, restart detection
+      window.addEventListener("focus", () => {
+        if (video.readyState >= 2) startDetection();
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden && video.readyState >= 2) startDetection();
+      });
+    }
+
+    init();
+  </script>
+</body>
+</html>
