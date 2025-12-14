@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Dynamic Face Guard</title>
+  <title>Background Guard</title>
   <style>
     body, html { margin:0; padding:0; background:#000; height: 100vh; overflow: hidden; }
     #container {
@@ -13,7 +13,6 @@
       justify-content: center;
       align-items: center;
     }
-    /* Mirror the video */
     #webcam, #overlay {
       position: absolute;
       transform: scaleX(-1); 
@@ -27,7 +26,7 @@
       transform: translateX(-50%);
       color: white;
       font-family: sans-serif;
-      background: rgba(0, 0, 0, 0.6);
+      background: rgba(0, 0, 0, 0.7);
       padding: 10px 20px;
       border-radius: 20px;
       z-index: 10;
@@ -37,13 +36,12 @@
   </style>
 </head>
 <body>
-  <div id="status">Loading Face & Hand AI...<br><small>(Please wait 5-10 seconds)</small></div>
+  <div id="status">Loading System...<br><small>(Keep this window open)</small></div>
   <div id="container">
     <video id="webcam" autoplay muted playsinline></video>
     <canvas id="overlay"></canvas>
   </div>
 
-  <!-- MediaPipe Libraries -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
@@ -55,30 +53,42 @@
     let handLandmarker, faceLandmarker;
     let audioCtx;
     let lastBeep = 0;
+    let faceZone = null;
+    let videoElement = null;
+    let canvasElement = null;
+    let ctx = null;
+
+    // --- SETTINGS YOU REQUESTED ---
+    const BEEP_COOLDOWN = 800;   // Faster: 0.8 seconds between sounds
+    const BOX_WIDTH_SCALE = 0.6; // Narrower: Only uses 60% of face width
     
-    // CONFIGURATION
-    const BEEP_COOLDOWN = 1500; // 1.5 seconds silence between alerts
-    
-    // VARIABLES TO STORE FACE COORDINATES
-    let faceZone = null; // Will store {minX, maxX, minY, maxY}
+    // --- WEB WORKER HACK (To run in background tabs) ---
+    // This creates a "timer" that runs in a separate thread, forcing the browser
+    // to pay attention even if the tab is hidden.
+    const workerBlob = new Blob([`
+      self.onmessage = function(e) {
+        if (e.data === "start") {
+          setInterval(() => { postMessage("tick"); }, 100); // Check every 100ms
+        }
+      };
+    `], { type: "text/javascript" });
+    const worker = new Worker(URL.createObjectURL(workerBlob));
 
     async function init() {
-      const video = document.getElementById("webcam");
-      const overlay = document.getElementById("overlay");
-      const ctx = overlay.getContext("2d");
       const status = document.getElementById("status");
+      videoElement = document.getElementById("webcam");
+      canvasElement = document.getElementById("overlay");
+      ctx = canvasElement.getContext("2d");
 
-      // 1. Audio Setup
-      try {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      } catch (e) { console.error("Audio API error"); }
+      // 1. Audio
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } 
+      catch (e) {}
 
-      // 2. Load Vision Models (Face AND Hand)
+      // 2. Load Models
       const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
       );
       
-      // Load Hand Tracker
       handLandmarker = await HandLandmarker.createFromOptions(vision, {
         baseOptions: {
           modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
@@ -88,7 +98,6 @@
         numHands: 1
       });
 
-      // Load Face Tracker
       faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
         baseOptions: {
           modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
@@ -98,81 +107,87 @@
         numFaces: 1
       });
 
-      status.innerText = "System Active. Tracking Face.";
+      status.innerText = "Active. You can switch tabs now.";
 
       // 3. Start Camera
       const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      video.srcObject = stream;
-      video.addEventListener("loadeddata", () => {
-        overlay.width = video.videoWidth;
-        overlay.height = video.videoHeight;
-        startDetectionLoop(video, ctx);
+      videoElement.srcObject = stream;
+      
+      videoElement.addEventListener("loadeddata", () => {
+        canvasElement.width = videoElement.videoWidth;
+        canvasElement.height = videoElement.videoHeight;
+        
+        // Start the Background Worker
+        worker.postMessage("start");
       });
     }
 
-    function startDetectionLoop(video, ctx) {
-      const loop = () => {
-        const now = performance.now();
-        
-        // A. Draw video frame
-        ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-        
-        // B. Detect Face first (To set the Zone)
-        if (faceLandmarker) {
-          const faceResult = faceLandmarker.detectForVideo(video, now);
-          if (faceResult.faceLandmarks && faceResult.faceLandmarks.length > 0) {
-            updateFaceZone(faceResult.faceLandmarks[0]);
-            drawFaceZone(ctx); // Visualize the zone
-          } else {
-            faceZone = null; // No face detected
-          }
-        }
+    // This function runs every time the Worker sends a "tick" (10x per second)
+    // regardless of whether the tab is focused or not.
+    worker.onmessage = function(e) {
+      if (e.data === "tick") {
+        runDetection();
+      }
+    };
 
-        // C. Detect Hands
-        if (handLandmarker && faceZone) {
-          const handResult = handLandmarker.detectForVideo(video, now);
+    function runDetection() {
+      if (!handLandmarker || !faceLandmarker || !videoElement || videoElement.readyState < 2) return;
+
+      const now = performance.now();
+      
+      // 1. Clear Screen
+      ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+
+      // 2. Detect Face
+      const faceResult = faceLandmarker.detectForVideo(videoElement, now);
+      if (faceResult.faceLandmarks && faceResult.faceLandmarks.length > 0) {
+        updateFaceZone(faceResult.faceLandmarks[0]);
+        drawFaceZone(ctx);
+      } else {
+        faceZone = null;
+      }
+
+      // 3. Detect Hands
+      if (faceZone) {
+        const handResult = handLandmarker.detectForVideo(videoElement, now);
+        if (handResult.landmarks && handResult.landmarks.length > 0) {
+          const hand = handResult.landmarks[0];
           
-          if (handResult.landmarks && handResult.landmarks.length > 0) {
-            const hand = handResult.landmarks[0];
-            
-            // Draw Hand (Visual Feedback)
-            drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(0, 255, 0, 0.3)", lineWidth: 2 });
+          // Draw Hand (Light Green)
+          drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(0, 255, 0, 0.2)", lineWidth: 2 });
 
-            // Check Collision
-            if (checkCollision(hand)) {
-              // CHANGE COLOR TO RED
-              drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(255, 0, 0, 1)", lineWidth: 4 });
-              
-              if (now - lastBeep > BEEP_COOLDOWN) {
-                playNotificationSound();
-                lastBeep = now;
-              }
-            }
+          if (checkCollision(hand)) {
+             // Red Alert
+             drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(255, 0, 0, 0.9)", lineWidth: 4 });
+             if (now - lastBeep > BEEP_COOLDOWN) {
+               playNotificationSound();
+               lastBeep = now;
+             }
           }
         }
-
-        requestAnimationFrame(loop);
-      };
-      loop();
+      }
     }
 
-    // --- LOGIC: CALCULATE THE MOUSTACHE ZONE ---
+    // --- NARROW BOX LOGIC ---
     function updateFaceZone(landmarks) {
-      // Key Points: 1(Nose Tip), 152(Chin), 234(Left Cheek), 454(Right Cheek)
-      // We want the box to cover Nose down to Chin.
-      const nose = landmarks[1]; 
+      // Points: 1(Nose), 152(Chin), 234(Left Face Edge), 454(Right Face Edge)
+      const nose = landmarks[1];
       const chin = landmarks[152];
-      const leftCheek = landmarks[234];
-      const rightCheek = landmarks[454];
+      const leftEdge = landmarks[234].x;
+      const rightEdge = landmarks[454].x;
 
-      // Add a little padding/margin so it's not too tight
-      const padding = 0.05; 
+      // Calculate Center and Width
+      const centerX = (leftEdge + rightEdge) / 2;
+      const fullWidth = Math.abs(rightEdge - leftEdge);
+      
+      // Make width narrower based on your request
+      const scaledWidth = fullWidth * BOX_WIDTH_SCALE; 
 
       faceZone = {
-        minX: Math.min(leftCheek.x, rightCheek.x) - padding,
-        maxX: Math.max(leftCheek.x, rightCheek.x) + padding,
-        minY: nose.y - 0.05, // Start slightly above nose
-        maxY: chin.y + 0.05  // End slightly below chin
+        minX: centerX - (scaledWidth / 2),
+        maxX: centerX + (scaledWidth / 2),
+        minY: nose.y - 0.04, // Slightly above nose
+        maxY: chin.y + 0.05  // Slightly below chin
       };
     }
 
@@ -180,22 +195,20 @@
       if (!faceZone) return;
       const w = ctx.canvas.width;
       const h = ctx.canvas.height;
-
+      
       const bx = faceZone.minX * w;
       const by = faceZone.minY * h;
       const bw = (faceZone.maxX - faceZone.minX) * w;
       const bh = (faceZone.maxY - faceZone.minY) * h;
 
-      ctx.strokeStyle = "rgba(0, 200, 255, 0.6)"; // Blue Box
-      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(0, 200, 255, 0.4)";
+      ctx.lineWidth = 2;
       ctx.strokeRect(bx, by, bw, bh);
     }
 
     function checkCollision(hand) {
       if (!faceZone) return false;
-      // Check Index Tip (8) and Thumb Tip (4) and Middle Tip (12)
-      const tips = [8, 4, 12];
-      
+      const tips = [8, 4, 12]; // Index, Thumb, Middle
       for (let i of tips) {
         const x = hand[i].x;
         const y = hand[i].y;
@@ -206,7 +219,6 @@
       return false;
     }
 
-    // --- NEW SOUND: SHARP NOTIFICATION ---
     function playNotificationSound() {
       if (!audioCtx) return;
       if (audioCtx.state === 'suspended') audioCtx.resume();
@@ -215,25 +227,18 @@
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
 
-      // "Triangle" wave is sharper than Sine, but not annoying like Square
       osc.type = "triangle"; 
+      // Quick Ding
+      osc.frequency.setValueAtTime(700, t);
+      osc.frequency.setValueAtTime(0, t + 0.1); 
 
-      // PING - PING Pattern (Double Beep)
-      osc.frequency.setValueAtTime(880, t);       // High Pitch (A5)
-      osc.frequency.setValueAtTime(880, t + 0.1); 
-      osc.frequency.setValueAtTime(0, t + 0.11);  // Silence
-      osc.frequency.setValueAtTime(587, t + 0.15); // Lower Pitch (D5)
-
-      // Volume Envelope (Short and crisp)
       gain.gain.setValueAtTime(0.1, t);
-      gain.gain.linearRampToValueAtTime(0.1, t + 0.1);
-      gain.gain.setValueAtTime(0.0, t + 0.11); // Cut
-      gain.gain.setValueAtTime(0.1, t + 0.15); // Second beep
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.4); // Fade out
+      gain.gain.linearRampToValueAtTime(0.1, t + 0.05);
+      gain.gain.setValueAtTime(0, t + 0.1);
 
       osc.connect(gain).connect(audioCtx.destination);
       osc.start();
-      osc.stop(t + 0.5);
+      osc.stop(t + 0.2);
     }
 
     init();
