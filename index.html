@@ -2,46 +2,46 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Hand Detection Alarm</title>
+  <title>Smart Habit Tracker</title>
   <style>
-    body, html { margin:0; padding:0; background:#000; }
+    body, html { margin:0; padding:0; background:#000; height: 100vh; overflow: hidden; }
     #container {
-      position: absolute;
-      top: 10px; left: 10px;
-      width: 320px; height: 240px;
-      overflow: hidden;
-      border: 2px solid #f00;
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
     }
+    /* Mirror the video so it feels like a mirror */
     #webcam, #overlay {
       position: absolute;
-      width: 320px; height: 240px;
-      top:0; left:0;
-      object-fit: cover;
+      transform: scaleX(-1); 
+      max-width: 100%;
+      max-height: 100%;
     }
-    #overlay { pointer-events:none; }
-    #unlockOverlay {
-      position: absolute; top:0; left:0;
-      width:100vw; height:100vh;
-      background: rgba(0,0,0,0.7);
-      color:#fff; display:flex;
-      align-items:center; justify-content:center;
-      font-size:1.2em; text-align:center;
-      z-index:10;
+    #status {
+      position: absolute;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: white;
+      font-family: sans-serif;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 10px 20px;
+      border-radius: 20px;
+      z-index: 10;
+      pointer-events: none;
     }
-    #unlockOverlay.hidden { display:none; }
   </style>
 </head>
 <body>
+  <div id="status">Loading AI...</div>
   <div id="container">
     <video id="webcam" autoplay muted playsinline></video>
-    <canvas id="overlay" width="320" height="240"></canvas>
-  </div>
-  <div id="unlockOverlay">
-    Tap or click anywhere to enable sound<br>
-    (required by most browsers)
+    <canvas id="overlay"></canvas>
   </div>
 
-  <!-- drawing utils -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
 
@@ -49,100 +49,150 @@
     import { HandLandmarker, FilesetResolver }
       from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
 
-    let handLandmarker, audioCtx;
-    let lastBeep = 0, detectInterval = null;
-    const BEEP_INTERVAL_MS = 500, POLL_MS = 200;
-
-    async function startDetection() {
-      const video   = document.getElementById("webcam");
-      const overlay = document.getElementById("overlay");
-      const ctx     = overlay.getContext("2d");
-
-      // Ensure model is loaded
-      if (!handLandmarker) {
-        const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
-        );
-        handLandmarker = await HandLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-            delegate: "GPU"
-          },
-          runningMode: "VIDEO",
-          numHands: 2
-        });
-      }
-
-      // If interval already running, clear it
-      if (detectInterval) {
-        clearInterval(detectInterval);
-      }
-      // Polling loop
-      detectInterval = setInterval(() => detectFrame(video, ctx), POLL_MS);
-    }
-
-    function detectFrame(video, ctx) {
-      try {
-        const startTime = performance.now();
-        const results   = handLandmarker.detectForVideo(video, startTime);
-        ctx.drawImage(video, 0, 0, ctx.canvas.width, ctx.canvas.height);
-
-        if (results.landmarks?.length) {
-          for (const lm of results.landmarks) {
-            drawConnectors(ctx, lm, HAND_CONNECTIONS, { color:"#f00", lineWidth:2 });
-            drawLandmarks(ctx, lm, { color:"#0f0", lineWidth:1 });
-          }
-          const now = performance.now();
-          if (now - lastBeep > BEEP_INTERVAL_MS) {
-            playWarningBeep();
-            lastBeep = now;
-          }
-        }
-      } catch (e) {
-        console.error("detect error:", e);
-      }
-    }
-
-    function playWarningBeep() {
-      if (!audioCtx || audioCtx.state === "suspended") return;
-      const pulseCount = 3, pulseFreq = 1000, pulseDur = 0.2, interPulse = 0.1;
-      for (let i = 0; i < pulseCount; i++) {
-        const t0 = audioCtx.currentTime + i * (pulseDur + interPulse);
-        const osc  = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = "square";
-        osc.frequency.value = pulseFreq;
-        gain.gain.setValueAtTime(1.2, t0);
-        gain.gain.exponentialRampToValueAtTime(0.001, t0 + pulseDur);
-        osc.connect(gain).connect(audioCtx.destination);
-        osc.start(t0);
-        osc.stop(t0 + pulseDur);
-      }
-    }
+    let handLandmarker;
+    let audioCtx;
+    let lastBeep = 0;
+    
+    // --- SMART SETTINGS ---
+    const BEEP_COOLDOWN = 1500;  // Silence for 1.5s after a beep
+    const POLL_MS = 100;         // Check 10 times a second
+    
+    // THE DANGER ZONE (The Box)
+    // x: 0.3 to 0.7 means the middle 40% of the screen width
+    // y: 0.0 to 0.5 means the top 50% of the screen height (Where your face is)
+    const ZONE = {
+        minX: 0.30, 
+        maxX: 0.70, 
+        minY: 0.0, 
+        maxY: 0.55 
+    };
 
     async function init() {
-      // Prime AudioContext
-      document.body.addEventListener("pointerdown", () => {
-        if (!audioCtx) {
-          audioCtx = new (window.AudioContext||window.webkitAudioContext)();
-          audioCtx.resume()
-            .then(() => document.getElementById("unlockOverlay").classList.add("hidden"));
-        }
-      }, { once: true });
-
-      // Start webcam
       const video = document.getElementById("webcam");
-      video.srcObject = await navigator.mediaDevices.getUserMedia({ video: true });
-      video.addEventListener("loadeddata", startDetection);
+      const overlay = document.getElementById("overlay");
+      const ctx = overlay.getContext("2d");
+      const status = document.getElementById("status");
 
-      // On tab focus or visibility change, restart detection
-      window.addEventListener("focus", () => {
-        if (video.readyState >= 2) startDetection();
+      // 1. Silent Audio Start
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      } catch (e) { console.error("Audio API error"); }
+
+      // 2. Load AI
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+      );
+      
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 1
       });
-      document.addEventListener("visibilitychange", () => {
-        if (!document.hidden && video.readyState >= 2) startDetection();
+
+      status.innerText = "Align Face in Red Box";
+
+      // 3. Start Camera
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      video.srcObject = stream;
+      video.addEventListener("loadeddata", () => {
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+        startLoop(video, ctx);
       });
+    }
+
+    function startLoop(video, ctx) {
+      setInterval(() => {
+        if (!handLandmarker) return;
+
+        // A. Draw the "Safe Zone" Box
+        ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+        drawZoneBox(ctx);
+
+        // B. Detect Hands
+        const startTime = performance.now();
+        const results = handLandmarker.detectForVideo(video, startTime);
+
+        if (results.landmarks && results.landmarks.length > 0) {
+          const hand = results.landmarks[0]; // Get the first hand detected
+
+          // C. Check if Hand is in the Danger Zone
+          if (isHandInFaceZone(hand)) {
+             // Draw Hand in RED (Warning)
+             drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(255, 0, 0, 0.8)", lineWidth: 3 });
+             
+             // Play Sound
+             const now = performance.now();
+             if (now - lastBeep > BEEP_COOLDOWN) {
+               playGentleChime();
+               lastBeep = now;
+             }
+          } else {
+             // Hand is safe (Low down) - Draw in GREEN
+             drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(0, 255, 0, 0.3)", lineWidth: 2 });
+          }
+        }
+      }, POLL_MS);
+    }
+
+    // Logic: Is any fingertip inside the box?
+    function isHandInFaceZone(landmarks) {
+        // We check index finger tip (8) and middle finger tip (12)
+        const pointsToCheck = [8, 12, 4]; // 4 is Thumb
+        
+        for (let i of pointsToCheck) {
+            const x = landmarks[i].x;
+            const y = landmarks[i].y;
+            
+            // Check if point is inside our defined ZONE
+            if (x > ZONE.minX && x < ZONE.maxX && y > ZONE.minY && y < ZONE.maxY) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function drawZoneBox(ctx) {
+        const w = ctx.canvas.width;
+        const h = ctx.canvas.height;
+        
+        // Convert percentage to pixels
+        const bx = ZONE.minX * w;
+        const by = ZONE.minY * h;
+        const bw = (ZONE.maxX - ZONE.minX) * w;
+        const bh = (ZONE.maxY - ZONE.minY) * h;
+
+        ctx.strokeStyle = "rgba(255, 0, 0, 0.5)";
+        ctx.lineWidth = 4;
+        ctx.strokeRect(bx, by, bw, bh);
+        
+        // Label
+        ctx.fillStyle = "rgba(255, 0, 0, 0.5)";
+        ctx.font = "16px Arial";
+        ctx.fillText("NO TOUCH ZONE", bx + 10, by + 30);
+    }
+
+    function playGentleChime() {
+      if (!audioCtx) return;
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+
+      osc.type = "sine"; 
+      osc.frequency.setValueAtTime(500, audioCtx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(400, audioCtx.currentTime + 0.5);
+
+      gain.gain.setValueAtTime(0, audioCtx.currentTime);
+      gain.gain.linearRampToValueAtTime(0.05, audioCtx.currentTime + 0.1); // Very Quiet (5%)
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.6);
     }
 
     init();
