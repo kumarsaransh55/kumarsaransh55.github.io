@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Background Guard</title>
+  <title>Resilient Habit Guard</title>
   <style>
     body, html { margin:0; padding:0; background:#000; height: 100vh; overflow: hidden; }
     #container {
@@ -32,11 +32,12 @@
       z-index: 10;
       pointer-events: none;
       text-align: center;
+      transition: opacity 0.5s;
     }
   </style>
 </head>
 <body>
-  <div id="status">Loading System...<br><small>(Keep this window open)</small></div>
+  <div id="status">Starting System...</div>
   <div id="container">
     <video id="webcam" autoplay muted playsinline></video>
     <canvas id="overlay"></canvas>
@@ -50,6 +51,12 @@
     import { HandLandmarker, FaceLandmarker, FilesetResolver }
       from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
 
+    // --- CONFIGURATION ---
+    const BEEP_COOLDOWN = 800;    
+    const BOX_WIDTH_SCALE = 0.75; // Increased width (was 0.6)
+    const BOX_PADDING_Y = 0.08;   // Increased height padding
+
+    // VARIABLES
     let handLandmarker, faceLandmarker;
     let audioCtx;
     let lastBeep = 0;
@@ -57,18 +64,15 @@
     let videoElement = null;
     let canvasElement = null;
     let ctx = null;
+    let isRestarting = false;
+    let lastVideoTime = 0;
+    let stuckFrameCount = 0;
 
-    // --- SETTINGS YOU REQUESTED ---
-    const BEEP_COOLDOWN = 800;   // Faster: 0.8 seconds between sounds
-    const BOX_WIDTH_SCALE = 0.6; // Narrower: Only uses 60% of face width
-    
-    // --- WEB WORKER HACK (To run in background tabs) ---
-    // This creates a "timer" that runs in a separate thread, forcing the browser
-    // to pay attention even if the tab is hidden.
+    // --- WORKER FOR BACKGROUND PROCESSING ---
     const workerBlob = new Blob([`
       self.onmessage = function(e) {
         if (e.data === "start") {
-          setInterval(() => { postMessage("tick"); }, 100); // Check every 100ms
+          setInterval(() => { postMessage("tick"); }, 100);
         }
       };
     `], { type: "text/javascript" });
@@ -81,49 +85,98 @@
       ctx = canvasElement.getContext("2d");
 
       // 1. Audio
-      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } 
-      catch (e) {}
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
 
       // 2. Load Models
+      status.innerText = "Loading AI Models...";
       const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
       );
       
       handLandmarker = await HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-          delegate: "GPU"
-        },
-        runningMode: "VIDEO",
-        numHands: 1
+        baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
+        runningMode: "VIDEO", numHands: 1
       });
 
       faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-          delegate: "GPU"
-        },
-        runningMode: "VIDEO",
-        numFaces: 1
+        baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate: "GPU" },
+        runningMode: "VIDEO", numFaces: 1
       });
 
-      status.innerText = "Active. You can switch tabs now.";
-
       // 3. Start Camera
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      videoElement.srcObject = stream;
+      await startCamera();
       
-      videoElement.addEventListener("loadeddata", () => {
-        canvasElement.width = videoElement.videoWidth;
-        canvasElement.height = videoElement.videoHeight;
-        
-        // Start the Background Worker
-        worker.postMessage("start");
+      // 4. Start Worker
+      worker.postMessage("start");
+      
+      // 5. Add Wake-up Listener (Backup)
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+          checkCameraHealth();
+        }
       });
     }
 
-    // This function runs every time the Worker sends a "tick" (10x per second)
-    // regardless of whether the tab is focused or not.
+    async function startCamera() {
+      const status = document.getElementById("status");
+      try {
+        status.innerText = "Activating Camera...";
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        videoElement.srcObject = stream;
+        
+        // Wait for video to actually play
+        await new Promise((resolve) => {
+          videoElement.onloadeddata = () => {
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+            videoElement.play();
+            resolve();
+          };
+        });
+        
+        status.innerText = "Active. Monitoring...";
+        setTimeout(() => { status.style.opacity = "0.5"; }, 2000);
+        isRestarting = false;
+        
+      } catch (err) {
+        console.error("Camera Error:", err);
+        status.innerText = "Camera Error! Click here to retry.";
+        status.onclick = () => location.reload();
+      }
+    }
+
+    // --- RESTART LOGIC (For Sleep/Wake) ---
+    async function checkCameraHealth() {
+      if (isRestarting) return;
+
+      // Logic: If video currentTime hasn't changed in 20 ticks (2 seconds), it's frozen.
+      if (videoElement.currentTime === lastVideoTime) {
+        stuckFrameCount++;
+      } else {
+        stuckFrameCount = 0;
+        lastVideoTime = videoElement.currentTime;
+      }
+
+      // If stuck for > 2 seconds (20 ticks), force restart
+      if (stuckFrameCount > 20) {
+        console.log("Camera appears frozen. Restarting...");
+        isRestarting = true;
+        
+        // Stop old tracks
+        if (videoElement.srcObject) {
+          videoElement.srcObject.getTracks().forEach(track => track.stop());
+        }
+        
+        document.getElementById("status").innerText = "Waking up camera...";
+        document.getElementById("status").style.opacity = "1";
+        
+        // Small delay to let OS release camera
+        setTimeout(startCamera, 1000); 
+        stuckFrameCount = 0;
+      }
+    }
+
+    // --- MAIN LOOP ---
     worker.onmessage = function(e) {
       if (e.data === "tick") {
         runDetection();
@@ -131,14 +184,19 @@
     };
 
     function runDetection() {
-      if (!handLandmarker || !faceLandmarker || !videoElement || videoElement.readyState < 2) return;
+      // 0. Watchdog Check
+      if (videoElement && videoElement.readyState >= 2) {
+        checkCameraHealth();
+      } else {
+        return; // Camera not ready
+      }
+
+      if (!handLandmarker || !faceLandmarker) return;
 
       const now = performance.now();
-      
-      // 1. Clear Screen
       ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
 
-      // 2. Detect Face
+      // 1. Detect Face
       const faceResult = faceLandmarker.detectForVideo(videoElement, now);
       if (faceResult.faceLandmarks && faceResult.faceLandmarks.length > 0) {
         updateFaceZone(faceResult.faceLandmarks[0]);
@@ -147,18 +205,18 @@
         faceZone = null;
       }
 
-      // 3. Detect Hands
+      // 2. Detect Hands
       if (faceZone) {
         const handResult = handLandmarker.detectForVideo(videoElement, now);
         if (handResult.landmarks && handResult.landmarks.length > 0) {
           const hand = handResult.landmarks[0];
           
-          // Draw Hand (Light Green)
+          // Draw Hand (Subtle Green)
           drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(0, 255, 0, 0.2)", lineWidth: 2 });
 
           if (checkCollision(hand)) {
              // Red Alert
-             drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(255, 0, 0, 0.9)", lineWidth: 4 });
+             drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(255, 0, 0, 0.8)", lineWidth: 4 });
              if (now - lastBeep > BEEP_COOLDOWN) {
                playNotificationSound();
                lastBeep = now;
@@ -168,26 +226,23 @@
       }
     }
 
-    // --- NARROW BOX LOGIC ---
+    // --- DIMENSIONS LOGIC ---
     function updateFaceZone(landmarks) {
-      // Points: 1(Nose), 152(Chin), 234(Left Face Edge), 454(Right Face Edge)
+      // Points: 1(Nose), 152(Chin), 234(Left Edge), 454(Right Edge)
       const nose = landmarks[1];
       const chin = landmarks[152];
       const leftEdge = landmarks[234].x;
       const rightEdge = landmarks[454].x;
 
-      // Calculate Center and Width
       const centerX = (leftEdge + rightEdge) / 2;
       const fullWidth = Math.abs(rightEdge - leftEdge);
-      
-      // Make width narrower based on your request
       const scaledWidth = fullWidth * BOX_WIDTH_SCALE; 
 
       faceZone = {
         minX: centerX - (scaledWidth / 2),
         maxX: centerX + (scaledWidth / 2),
-        minY: nose.y - 0.04, // Slightly above nose
-        maxY: chin.y + 0.05  // Slightly below chin
+        minY: nose.y - BOX_PADDING_Y, // Higher
+        maxY: chin.y + BOX_PADDING_Y  // Lower
       };
     }
 
@@ -228,7 +283,6 @@
       const gain = audioCtx.createGain();
 
       osc.type = "triangle"; 
-      // Quick Ding
       osc.frequency.setValueAtTime(700, t);
       osc.frequency.setValueAtTime(0, t + 0.1); 
 
