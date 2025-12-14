@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Resilient Habit Guard</title>
+  <title>Optimized Habit Guard</title>
   <style>
     body, html { margin:0; padding:0; background:#000; height: 100vh; overflow: hidden; }
     #container {
@@ -53,8 +53,10 @@
 
     // --- CONFIGURATION ---
     const BEEP_COOLDOWN = 800;    
-    const BOX_WIDTH_SCALE = 0.75; // Increased width (was 0.6)
-    const BOX_PADDING_Y = 0.08;   // Increased height padding
+    
+    // UPDATED DIMENSIONS:
+    const BOX_WIDTH_SCALE = 0.85; // Increased width (was 0.75)
+    // Note: Height padding is now hardcoded below to be tighter (0.04 and 0.05)
 
     // VARIABLES
     let handLandmarker, faceLandmarker;
@@ -109,7 +111,7 @@
       // 4. Start Worker
       worker.postMessage("start");
       
-      // 5. Add Wake-up Listener (Backup)
+      // 5. Add Wake-up Listener
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible") {
           checkCameraHealth();
@@ -124,7 +126,6 @@
         const stream = await navigator.mediaDevices.getUserMedia({ video: true });
         videoElement.srcObject = stream;
         
-        // Wait for video to actually play
         await new Promise((resolve) => {
           videoElement.onloadeddata = () => {
             canvasElement.width = videoElement.videoWidth;
@@ -145,11 +146,8 @@
       }
     }
 
-    // --- RESTART LOGIC (For Sleep/Wake) ---
     async function checkCameraHealth() {
       if (isRestarting) return;
-
-      // Logic: If video currentTime hasn't changed in 20 ticks (2 seconds), it's frozen.
       if (videoElement.currentTime === lastVideoTime) {
         stuckFrameCount++;
       } else {
@@ -157,26 +155,18 @@
         lastVideoTime = videoElement.currentTime;
       }
 
-      // If stuck for > 2 seconds (20 ticks), force restart
       if (stuckFrameCount > 20) {
-        console.log("Camera appears frozen. Restarting...");
         isRestarting = true;
-        
-        // Stop old tracks
         if (videoElement.srcObject) {
           videoElement.srcObject.getTracks().forEach(track => track.stop());
         }
-        
         document.getElementById("status").innerText = "Waking up camera...";
         document.getElementById("status").style.opacity = "1";
-        
-        // Small delay to let OS release camera
         setTimeout(startCamera, 1000); 
         stuckFrameCount = 0;
       }
     }
 
-    // --- MAIN LOOP ---
     worker.onmessage = function(e) {
       if (e.data === "tick") {
         runDetection();
@@ -184,11 +174,10 @@
     };
 
     function runDetection() {
-      // 0. Watchdog Check
       if (videoElement && videoElement.readyState >= 2) {
         checkCameraHealth();
       } else {
-        return; // Camera not ready
+        return; 
       }
 
       if (!handLandmarker || !faceLandmarker) return;
@@ -210,12 +199,9 @@
         const handResult = handLandmarker.detectForVideo(videoElement, now);
         if (handResult.landmarks && handResult.landmarks.length > 0) {
           const hand = handResult.landmarks[0];
-          
-          // Draw Hand (Subtle Green)
           drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(0, 255, 0, 0.2)", lineWidth: 2 });
 
           if (checkCollision(hand)) {
-             // Red Alert
              drawConnectors(ctx, hand, HAND_CONNECTIONS, { color: "rgba(255, 0, 0, 0.8)", lineWidth: 4 });
              if (now - lastBeep > BEEP_COOLDOWN) {
                playNotificationSound();
@@ -226,7 +212,7 @@
       }
     }
 
-    // --- DIMENSIONS LOGIC ---
+    // --- UPDATED DIMENSIONS LOGIC ---
     function updateFaceZone(landmarks) {
       // Points: 1(Nose), 152(Chin), 234(Left Edge), 454(Right Edge)
       const nose = landmarks[1];
@@ -236,13 +222,16 @@
 
       const centerX = (leftEdge + rightEdge) / 2;
       const fullWidth = Math.abs(rightEdge - leftEdge);
+      
+      // WIDER BOX (0.85 scale)
       const scaledWidth = fullWidth * BOX_WIDTH_SCALE; 
 
       faceZone = {
         minX: centerX - (scaledWidth / 2),
         maxX: centerX + (scaledWidth / 2),
-        minY: nose.y - BOX_PADDING_Y, // Higher
-        maxY: chin.y + BOX_PADDING_Y  // Lower
+        // TIGHTER HEIGHT (Reverted to the 'before' values)
+        minY: nose.y - 0.04, 
+        maxY: chin.y + 0.05 
       };
     }
 
@@ -263,7 +252,7 @@
 
     function checkCollision(hand) {
       if (!faceZone) return false;
-      const tips = [8, 4, 12]; // Index, Thumb, Middle
+      const tips = [8, 4, 12]; 
       for (let i of tips) {
         const x = hand[i].x;
         const y = hand[i].y;
